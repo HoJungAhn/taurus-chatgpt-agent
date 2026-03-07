@@ -1,3 +1,10 @@
+# project ignores
+.claude/
+.venv/
+.pytest_cache/
+similarity.db
+.env.example
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
