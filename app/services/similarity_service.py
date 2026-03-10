@@ -11,13 +11,16 @@ SQLite에 error_stack과 ChatGPT 결과를 저장하고, 새 요청이 들어올
 - 벡터를 DB에 저장하지 않고 조회 시 즉석 계산: 직렬화 복잡성 제거, 소규모 데이터에 충분
 """
 
+import logging
 import sqlite3
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+logger = logging.getLogger(__name__)
 
 
 class BaseSimilarityService(ABC):
@@ -34,13 +37,14 @@ class BaseSimilarityService(ABC):
         ...
 
     @abstractmethod
-    def find_similar(self, interface_id: str, error_stack: str) -> Optional[str]:
+    def find_similar(self, interface_id: str, error_stack: str) -> Tuple[Optional[str], Optional[float]]:
         """
         동일 interface_id 범위 내에서 유사한 error_stack을 검색한다.
 
         Returns:
-            유사도 threshold 이상인 기존 chatgpt_result 문자열,
-            또는 유사 결과가 없으면 None.
+            (chatgpt_result, max_sim): HIT 시 결과 문자열과 유사도
+            (None, max_sim): MISS 시 None과 유사도
+            (None, None): stored=0 (데이터 없음) 시
         """
         ...
 
@@ -63,14 +67,16 @@ class TFIDFSimilarityService(BaseSimilarityService):
     check_same_thread=False: FastAPI의 async 환경에서 여러 코루틴이 같은 연결을 공유하기 위해 필요.
     """
 
-    def __init__(self, db_path: str, threshold: float):
+    def __init__(self, db_path: str, threshold: float, max_records_per_interface: int = 5):
         """
         Args:
             db_path: SQLite DB 파일 경로 (환경 변수 SIMILARITY_DB_PATH)
             threshold: 캐시 히트 판단 유사도 임계값 (환경 변수 SIMILARITY_THRESHOLD, 기본 0.8)
+            max_records_per_interface: interface_id당 최대 저장 건수 (환경 변수 SIMILARITY_MAX_RECORDS, 기본 5)
         """
         self.db_path = db_path
         self.threshold = threshold
+        self.max_records_per_interface = max_records_per_interface
         self._conn: Optional[sqlite3.Connection] = None
 
     def init_db(self) -> None:
@@ -78,20 +84,31 @@ class TFIDFSimilarityService(BaseSimilarityService):
         SQLite 연결을 열고 테이블과 인덱스를 생성한다.
         IF NOT EXISTS 구문으로 이미 존재하는 경우 재생성을 방지한다.
         interface_id 인덱스는 동일 interface_id 조회 성능을 위해 생성한다.
+        기존 DB에 last_accessed_at 컬럼이 없으면 ALTER TABLE로 추가한다.
         """
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS similarity_store (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                interface_id   TEXT    NOT NULL,
-                error_stack    TEXT    NOT NULL,
-                chatgpt_result TEXT    NOT NULL,
-                created_at     TEXT    NOT NULL   -- ISO 8601 UTC 형식
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                interface_id      TEXT    NOT NULL,
+                error_stack       TEXT    NOT NULL,
+                chatgpt_result    TEXT    NOT NULL,
+                created_at        TEXT    NOT NULL,   -- ISO 8601 UTC 형식
+                last_accessed_at  TEXT    NULL        -- LRU 기준: 마지막 cache HIT 시각
             )
         """)
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_interface_id ON similarity_store(interface_id)"
         )
+        # 기존 DB 파일에 last_accessed_at 컬럼이 없으면 추가 (마이그레이션)
+        existing_columns = [
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(similarity_store)").fetchall()
+        ]
+        if "last_accessed_at" not in existing_columns:
+            self._conn.execute(
+                "ALTER TABLE similarity_store ADD COLUMN last_accessed_at TEXT NULL"
+            )
         self._conn.commit()
 
     def close_db(self) -> None:
@@ -104,6 +121,8 @@ class TFIDFSimilarityService(BaseSimilarityService):
         """
         ChatGPT 정제 결과를 DB에 저장한다.
         created_at은 UTC 기준 ISO 8601 형식으로 저장한다.
+        저장 후 interface_id당 건수가 max_records_per_interface를 초과하면
+        last_accessed_at 기준 가장 오래된 row를 삭제한다 (LRU 축출).
 
         Note: ChatGPT timeout 또는 오류 시에는 이 메서드를 호출하지 않는다.
         """
@@ -112,9 +131,28 @@ class TFIDFSimilarityService(BaseSimilarityService):
             "INSERT INTO similarity_store (interface_id, error_stack, chatgpt_result, created_at) VALUES (?, ?, ?, ?)",
             (interface_id, error_stack, chatgpt_result, created_at),
         )
+        # INSERT 후 해당 interface_id의 건수 확인
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM similarity_store WHERE interface_id = ?",
+            (interface_id,),
+        ).fetchone()[0]
+        # max_records_per_interface 초과 시 last_accessed_at 기준 가장 오래된 row 삭제 (NULL 우선)
+        if count > self.max_records_per_interface:
+            self._conn.execute(
+                """
+                DELETE FROM similarity_store
+                WHERE id = (
+                    SELECT id FROM similarity_store
+                    WHERE interface_id = ?
+                    ORDER BY last_accessed_at ASC NULLS FIRST
+                    LIMIT 1
+                )
+                """,
+                (interface_id,),
+            )
         self._conn.commit()
 
-    def find_similar(self, interface_id: str, error_stack: str) -> Optional[str]:
+    def find_similar(self, interface_id: str, error_stack: str) -> Tuple[Optional[str], Optional[float]]:
         """
         동일 interface_id의 저장된 error_stack들과 TF-IDF + Cosine Similarity를 계산한다.
 
@@ -130,21 +168,28 @@ class TFIDFSimilarityService(BaseSimilarityService):
             error_stack: 유사도 비교 대상 신규 error stacktrace
 
         Returns:
-            유사한 기존 chatgpt_result 문자열, 없으면 None.
+            (chatgpt_result, max_sim): HIT 시 결과 문자열과 유사도
+            (None, max_sim): MISS 시 None과 유사도
+            (None, None): stored=0 (데이터 없음) 시
         """
-        # 동일 interface_id의 기존 데이터 전체 조회
+        # 동일 interface_id의 기존 데이터 전체 조회 (id 포함: HIT 시 last_accessed_at 갱신용)
         cursor = self._conn.execute(
-            "SELECT error_stack, chatgpt_result FROM similarity_store WHERE interface_id = ?",
+            "SELECT id, error_stack, chatgpt_result FROM similarity_store WHERE interface_id = ?",
             (interface_id,),
         )
         rows = cursor.fetchall()
 
-        # 저장된 데이터가 없으면 즉시 None 반환
+        # 저장된 데이터가 없으면 즉시 (None, None) 반환 — similarity 계산 불가
         if not rows:
-            return None
+            logger.info(
+                "similarity_search | interface_id=%s stored=0 result=SKIP",
+                interface_id,
+            )
+            return None, None
 
-        stored_stacks = [row[0] for row in rows]
-        stored_results = [row[1] for row in rows]
+        stored_ids = [row[0] for row in rows]
+        stored_stacks = [row[1] for row in rows]
+        stored_results = [row[2] for row in rows]
 
         # corpus = 기존 텍스트들 + 신규 텍스트 (마지막 원소가 신규)
         # TfidfVectorizer.fit_transform으로 전체 corpus를 한 번에 벡터화
@@ -157,12 +202,28 @@ class TFIDFSimilarityService(BaseSimilarityService):
         stored_vecs = tfidf_matrix[:-1]
         similarities = cosine_similarity(new_vec, stored_vecs)[0]
 
-        # 가장 유사한 항목의 유사도가 threshold 이상이면 해당 결과 반환
         max_idx = similarities.argmax()
-        if similarities[max_idx] >= self.threshold:
-            return stored_results[max_idx]
+        max_sim = float(similarities[max_idx])
 
-        return None
+        if max_sim >= self.threshold:
+            # HIT: last_accessed_at을 현재 UTC 시각으로 갱신 (LRU 기준 유지)
+            now = datetime.now(timezone.utc).isoformat()
+            self._conn.execute(
+                "UPDATE similarity_store SET last_accessed_at = ? WHERE id = ?",
+                (now, stored_ids[max_idx]),
+            )
+            self._conn.commit()
+            logger.info(
+                "similarity_search | interface_id=%s stored=%d max_sim=%.4f threshold=%.2f result=HIT",
+                interface_id, len(rows), max_sim, self.threshold,
+            )
+            return stored_results[max_idx], max_sim
+
+        logger.info(
+            "similarity_search | interface_id=%s stored=%d max_sim=%.4f threshold=%.2f result=MISS",
+            interface_id, len(rows), max_sim, self.threshold,
+        )
+        return None, max_sim
 
     def get_summary(self) -> Dict:
         """

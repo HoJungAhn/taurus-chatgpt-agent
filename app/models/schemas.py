@@ -6,7 +6,7 @@ Pydantic BaseModel을 사용하여 JSON 직렬화/역직렬화 및 유효성 검
 """
 
 from pydantic import BaseModel
-from typing import Literal
+from typing import Literal, Optional
 
 
 class RefineRequest(BaseModel):
@@ -33,3 +33,4 @@ class RefineResponse(BaseModel):
     # - "timeout"      : ChatGPT API timeout 초과, 원본 error_stack 반환
     # - "chatgpt_error": ChatGPT API 오류 발생, 원본 error_stack 반환
     status: Literal["success", "cached", "timeout", "chatgpt_error"]
+    ratio: Optional[float] = None  # find_similar() 계산된 max_similarity (stored=0이면 null)

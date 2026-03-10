@@ -3,10 +3,11 @@
 ### Requirement: interface_id 기준 데이터 저장
 ChatGPT 성공 응답 시 `interface_id`, `error_stack`, `chatgpt_result`를 SQLite DB에 저장해야 한다.
 ChatGPT timeout 또는 오류 시에는 저장하지 않아야 한다.
+저장 후 해당 `interface_id`의 레코드가 최대 건수(5건)를 초과하면 `last_accessed_at` 기준 가장 오래된 레코드를 삭제해야 한다.
 
 #### Scenario: ChatGPT 성공 시 데이터 저장
 - **WHEN** ChatGPT API 호출이 성공하여 결과를 받았을 때
-- **THEN** `interface_id`, `error_stack`, `chatgpt_result`, `created_at`이 DB에 저장되어야 한다
+- **THEN** `interface_id`, `error_stack`, `chatgpt_result`, `created_at`, `last_accessed_at`이 DB에 저장되어야 한다
 
 #### Scenario: ChatGPT timeout 시 저장 없음
 - **WHEN** ChatGPT API 호출이 timeout으로 실패했을 때

@@ -35,8 +35,9 @@ async def refine(request: RefineRequest):
     from app.main import similarity_service
 
     # Step 1: similarity DB 캐시 조회
+    ratio = None
     try:
-        cached = similarity_service.find_similar(request.interface_id, request.error_stack)
+        cached, ratio = similarity_service.find_similar(request.interface_id, request.error_stack)
         if cached is not None:
             # 유사도 threshold 이상의 기존 결과 발견 → ChatGPT 호출 없이 즉시 반환
             return RefineResponse(
@@ -44,6 +45,7 @@ async def refine(request: RefineRequest):
                 refine_message=cached,
                 is_refined=True,
                 status="cached",
+                ratio=ratio,
             )
     except Exception:
         # similarity DB 오류는 전체 서비스 장애로 이어지지 않도록 무시하고
@@ -60,6 +62,7 @@ async def refine(request: RefineRequest):
             refine_message=result,
             is_refined=True,
             status="success",
+            ratio=ratio,
         )
     except TimeoutError:
         # ChatGPT 응답 시간 초과: 원본 error_stack을 refine_message로 반환
@@ -68,6 +71,7 @@ async def refine(request: RefineRequest):
             refine_message=request.error_stack,
             is_refined=False,
             status="timeout",
+            ratio=ratio,
         )
     except ChatGPTError:
         # ChatGPT API 오류: 원본 error_stack을 refine_message로 반환
@@ -76,6 +80,7 @@ async def refine(request: RefineRequest):
             refine_message=request.error_stack,
             is_refined=False,
             status="chatgpt_error",
+            ratio=ratio,
         )
 
 

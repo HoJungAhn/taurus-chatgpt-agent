@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Similarity DB 설정.
     similarity_db_path: str = "similarity.db"  # SQLite DB 파일 경로
     similarity_threshold: float = 0.8          # 캐시 히트 판단 유사도 임계값 (0~1)
+    similarity_max_records: int = 5            # interface_id당 최대 저장 건수 (LRU 축출 기준)
 
     class Config:
         env_file = ".env"          # 프로젝트 루트의 .env 파일에서 자동 로딩

@@ -22,6 +22,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 similarity_service = TFIDFSimilarityService(
     db_path=settings.similarity_db_path,
     threshold=settings.similarity_threshold,
+    max_records_per_interface=settings.similarity_max_records,
 )
 
 
